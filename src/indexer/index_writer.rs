@@ -77,9 +77,6 @@ pub struct IndexWriter {
 
     workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
-    operation_receiver: OperationReceiver,
-    operation_sender: OperationSender,
-
     segment_updater: SegmentUpdater,
 
     worker_id: usize,
@@ -192,7 +189,7 @@ fn index_documents(
     memory_budget: usize,
     segment: Segment,
     grouped_document_iterator: &mut dyn Iterator<Item = OperationGroup>,
-    segment_updater: &mut SegmentUpdater,
+    segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
 ) -> crate::Result<bool> {
     let schema = segment.schema();
@@ -306,8 +303,6 @@ impl IndexWriter {
             let err_msg = format!("The heap size per thread cannot exceed {}", HEAP_SIZE_MAX);
             return Err(TantivyError::InvalidArgument(err_msg));
         }
-        let (document_sender, document_receiver): (OperationSender, OperationReceiver) =
-            channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
 
         let delete_queue = DeleteQueue::new();
 
@@ -323,9 +318,6 @@ impl IndexWriter {
 
             heap_size_in_bytes_per_thread,
             index: index.clone(),
-
-            operation_receiver: document_receiver,
-            operation_sender: document_sender,
 
             segment_updater,
 
@@ -344,8 +336,7 @@ impl IndexWriter {
     }
 
     fn drop_sender(&mut self) {
-        let (sender, _receiver) = channel::bounded(1);
-        self.operation_sender = sender;
+        
     }
 
     /// If there are some merging threads, blocks until they all finish their work and
@@ -399,53 +390,30 @@ impl IndexWriter {
     /// Spawns a new worker thread for indexing.
     /// The thread consumes documents from the pipeline.
     fn add_indexing_worker(&mut self) -> crate::Result<()> {
-        let document_receiver_clone = self.operation_receiver.clone();
-        let mut segment_updater = self.segment_updater.clone();
+        Ok(())
+    }
 
-        let mut delete_cursor = self.delete_queue.cursor();
+
+    fn wrap_index_doc(&self, operation_grp: OperationGroup) -> crate::Result<()>{
+
+        let delete_cursor = self.delete_queue.cursor();
 
         let mem_budget = self.heap_size_in_bytes_per_thread;
         let index = self.index.clone();
-        let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
-            .name(format!("thrd-tantivy-index{}", self.worker_id))
-            .spawn(move || {
-                loop {
-                    let mut document_iterator =
-                        document_receiver_clone.clone().into_iter().peekable();
 
-                    // the peeking here is to avoid
-                    // creating a new segment's files
-                    // if no document are available.
-                    //
-                    // this is a valid guarantee as the
-                    // peeked document now belongs to
-                    // our local iterator.
-                    if let Some(operations) = document_iterator.peek() {
-                        if let Some(first) = operations.first() {
-                            delete_cursor.skip_to(first.opstamp);
-                        } else {
-                            return Ok(());
-                        }
-                    } else {
-                        // No more documents.
-                        // Happens when there is a commit, or if the `IndexWriter`
-                        // was dropped.
-                        return Ok(());
-                    }
-                    let segment = index.new_segment();
-                    index_documents(
-                        mem_budget,
-                        segment,
-                        &mut document_iterator,
-                        &mut segment_updater,
-                        delete_cursor.clone(),
-                    )?;
-                }
-            })?;
-        self.worker_id += 1;
-        self.workers_join_handle.push(join_handle);
+        let mut document_iterator = vec![operation_grp].into_iter();
+        
+        let segment = index.new_segment();
+        index_documents(
+            mem_budget,
+            segment,
+            &mut document_iterator,
+            &self.segment_updater,
+            delete_cursor.clone(),
+        )?;
         Ok(())
     }
+
 
     /// Accessor to the merge policy.
     pub fn get_merge_policy(&self) -> Arc<dyn MergePolicy> {
@@ -536,11 +504,8 @@ impl IndexWriter {
     ///
     /// Returns the former segment_ready channel.
     #[allow(unused_must_use)]
-    fn recreate_document_channel(&mut self) -> OperationReceiver {
-        let (document_sender, document_receiver): (OperationSender, OperationReceiver) =
-            channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
-        mem::replace(&mut self.operation_sender, document_sender);
-        mem::replace(&mut self.operation_receiver, document_receiver)
+    fn recreate_document_channel(&mut self) -> () {
+        
     }
 
     /// Rollback to the last commit
@@ -556,7 +521,6 @@ impl IndexWriter {
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
-        let document_receiver = self.operation_receiver.clone();
 
         // take the directory lock to create a new index_writer.
         let directory_lock = self
@@ -582,7 +546,6 @@ impl IndexWriter {
         //
         // This will reach an end as the only document_sender
         // was dropped with the index_writer.
-        for _ in document_receiver {}
 
         Ok(self.committed_opstamp)
     }
@@ -699,7 +662,7 @@ impl IndexWriter {
     pub fn add_document(&self, document: Document) -> Opstamp {
         let opstamp = self.stamper.stamp();
         let add_operation = AddOperation { opstamp, document };
-        let send_result = self.operation_sender.send(smallvec![add_operation]);
+        let send_result = self.wrap_index_doc(smallvec![add_operation]);
         if let Err(e) = send_result {
             panic!("Failed to index document. Sending to indexing channel failed. This probably means all of the indexing threads have panicked. {:?}", e);
         }
@@ -760,7 +723,7 @@ impl IndexWriter {
                 }
             }
         }
-        let send_result = self.operation_sender.send(adds);
+        let send_result = self.wrap_index_doc(adds);
         if let Err(e) = send_result {
             panic!("Failed to index document. Sending to indexing channel failed. This probably means all of the indexing threads have panicked. {:?}", e);
         };
